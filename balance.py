@@ -35,7 +35,6 @@ def setup_thai_font():
 
 setup_thai_font()
 
-# ตารางจุดทิ้งขยะตั้งต้น (ไม่มี Depot)
 DEFAULT_DATA = [
     ("ภูมิทัศน์(ใหม่)", 14.86903, 102.02135, 0.3),
     ("สวนพฤกษศาสตร์", 14.86991, 102.022113, 0.3),
@@ -146,9 +145,10 @@ def get_distance_matrix_osrm(locations):
     return pd.DataFrame(distance_matrix) / 1000.0
 
 # =====================================================================
-# 🧠 4. อัลกอริทึมการจัดเส้นทาง (เพิ่มระบบ Balanced Workload)
+# 🧠 4. อัลกอริทึมการจัดเส้นทาง (รวม 4 ระบบ)
 # =====================================================================
 def run_savings_algorithm(df_dist, demands, nodes, max_capacity):
+    """(1) Clarke-Wright Savings มาตรฐาน"""
     depot = nodes[0]
     customers = nodes[1:]
     savings = []
@@ -176,7 +176,49 @@ def run_savings_algorithm(df_dist, demands, nodes, max_capacity):
                     route_vols.pop(idx_j)
     return routes, route_vols
 
+def run_balanced_savings_algorithm(df_dist, demands, nodes, max_capacity, num_vehicles):
+    """(2) Balanced Clarke-Wright Savings (บาลานซ์ความจุระหว่างรถ)"""
+    depot = nodes[0]
+    customers = nodes[1:]
+    
+    # คำนวณหาเป้าหมายความจุเฉลี่ย (Target Soft Capacity)
+    total_demand = sum([demands[c] for c in customers])
+    min_trips = max(1, math.ceil(total_demand / max_capacity))
+    effective_vehicles = max(num_vehicles, min_trips)
+    target_cap = total_demand / effective_vehicles
+    
+    # ตั้งค่าเพดานจำลอง (บวกบัฟเฟอร์ 15% เพื่อความยืดหยุ่น)
+    soft_capacity = max(target_cap * 1.15, max([demands[c] for c in customers]))
+    effective_capacity = min(soft_capacity, max_capacity)
+
+    savings = []
+    for i in customers:
+        for j in customers:
+            if i != j:
+                s_ij = df_dist.loc[i, depot] + df_dist.loc[depot, j] - df_dist.loc[i, j]
+                if s_ij > 0: savings.append((s_ij, i, j))
+    savings.sort(key=lambda x: x[0], reverse=True)
+    routes, route_vols = [[c] for c in customers], [demands[c] for c in customers]
+
+    def get_route_idx(node):
+        for idx, r in enumerate(routes):
+            if node in r: return idx
+        return -1
+
+    for s_ij, i, j in savings:
+        idx_i, idx_j = get_route_idx(i), get_route_idx(j)
+        if idx_i != idx_j and idx_i != -1 and idx_j != -1:
+            if routes[idx_i][-1] == i and routes[idx_j][0] == j:
+                # ⚠️ ใช้ effective_capacity บังคับไม่ให้รถคันเดียวอมขยะไว้เยอะเกินไป
+                if route_vols[idx_i] + route_vols[idx_j] <= effective_capacity:
+                    routes[idx_i].extend(routes[idx_j])
+                    route_vols[idx_i] += route_vols[idx_j]
+                    routes.pop(idx_j)
+                    route_vols.pop(idx_j)
+    return routes, route_vols
+
 def run_sweep_algorithm(locations, demands, nodes, max_capacity):
+    """(3) Sweep Algorithm มาตรฐาน"""
     depot, depot_lat, depot_lon = nodes[0], locations[0][1], locations[0][2]
     customer_angles = []
     for i, item in enumerate(locations[1:]):
@@ -201,7 +243,7 @@ def run_sweep_algorithm(locations, demands, nodes, max_capacity):
     return routes, route_vols
 
 def run_balanced_sweep_algorithm(locations, demands, nodes, max_capacity):
-    """อัลกอริทึมพยายามรักษาสมดุลของปริมาณขยะในแต่ละรอบวิ่งให้เท่ากันที่สุด"""
+    """(4) Balanced Sweep Algorithm"""
     depot, depot_lat, depot_lon = nodes[0], locations[0][1], locations[0][2]
     customer_angles = []
     for i, item in enumerate(locations[1:]):
@@ -213,16 +255,14 @@ def run_balanced_sweep_algorithm(locations, demands, nodes, max_capacity):
     
     total_demand = sum([c['vol'] for c in customer_angles])
     num_routes = max(1, math.ceil(total_demand / max_capacity))
-    target_cap = total_demand / num_routes # หาค่าเฉลี่ยที่ควรจะเป็น
+    target_cap = total_demand / num_routes
 
     routes, route_vols, current_route, current_vol = [], [], [], 0.0
     for c in customer_angles:
-        # ตัดรอบเมื่อเกินความจุสูงสุด
         if current_vol + c['vol'] > max_capacity:
             routes.append(current_route)
             route_vols.append(current_vol)
             current_route, current_vol = [c['node']], c['vol']
-        # หรือ ตัดรอบเมื่อปริมาณถึงเป้าหมายเฉลี่ยแล้ว (Balancing condition)
         elif current_vol + c['vol'] > target_cap and current_vol >= (target_cap * 0.75):
             routes.append(current_route)
             route_vols.append(current_vol)
@@ -291,8 +331,8 @@ def create_interactive_map(routes, locations, nodes, routing_mode, G_osm=None):
 # =====================================================================
 # 🖥️ 6. หน้าจอผู้ใช้งาน (Streamlit UI)
 # =====================================================================
-st.title("🚛 Smart Waste Collection Routing System (Balanced Edition)")
-st.markdown("ระบบจัดเส้นทางพร้อมฟังก์ชันกระจายภาระงานรถขยะ (Load Balancing) และรองรับไฟล์แผนที่ออฟไลน์")
+st.title("🚛 Smart Waste Collection Routing System (Full Balanced Edition)")
+st.markdown("ระบบจัดเส้นทางอัจฉริยะ พร้อมฟังก์ชัน **Load Balancing (รักษาสมดุลภาระงาน)** สำหรับรถทุกคัน")
 
 # ----------------- SIDEBAR -----------------
 with st.sidebar:
@@ -323,11 +363,12 @@ with st.sidebar:
     max_capacity = st.number_input("ความจุสูงสุดของรถ (ลบ.ม.)", min_value=1.0, value=4.5)
     
     st.header("⚙️ 4. อัลกอริทึม & คาร์บอน")
-    # ⚠️ เพิ่ม Algorithm ที่ 3 สำหรับรักษาสมดุล
+    # ⚠️ อัปเดตเมนูให้มี Balanced Savings
     algorithm_choice = st.selectbox("เทคนิคการจัดเส้นทาง", (
-        "Balanced Workload Sweep (แนะนำ - สมดุลภาระงาน)", 
-        "Clarke-Wright Savings", 
-        "Sweep Algorithm (ปกติ)"
+        "Balanced Clarke-Wright Savings (แนะนำ)",
+        "Balanced Workload Sweep", 
+        "Clarke-Wright Savings (มาตรฐาน)", 
+        "Sweep Algorithm (มาตรฐาน)"
     ))
     fuel_economy = st.number_input("อัตราสิ้นเปลือง (กม./ลิตร)", value=5.0)
     fuel_price = st.number_input("ราคาน้ำมัน (บาท/ลิตร)", value=32.94)
@@ -395,15 +436,17 @@ if st.session_state.get('show_results', False):
             
         df_dist.columns = df_dist.index = nodes
         
-        # เลือกใช้อัลกอริทึมตามที่ผู้ใช้กำหนด
-        if algorithm_choice == "Clarke-Wright Savings":
+        # ⚠️ เรียกใช้งาน Algorithm ตามที่เลือก
+        if algorithm_choice == "Clarke-Wright Savings (มาตรฐาน)":
             routes, route_vols = run_savings_algorithm(df_dist, demands, nodes, max_capacity)
-        elif algorithm_choice == "Balanced Workload Sweep (แนะนำ - สมดุลภาระงาน)":
+        elif algorithm_choice == "Balanced Clarke-Wright Savings (แนะนำ)":
+            routes, route_vols = run_balanced_savings_algorithm(df_dist, demands, nodes, max_capacity, max_vehicles)
+        elif algorithm_choice == "Balanced Workload Sweep":
             routes, route_vols = run_balanced_sweep_algorithm(osrm_input_format, demands, nodes, max_capacity)
         else:
             routes, route_vols = run_sweep_algorithm(osrm_input_format, demands, nodes, max_capacity)
 
-        # คำนวณระยะทางของแต่ละรอบ (Trip Distance) สำหรับการจ่ายงานให้รถ
+        # คำนวณระยะทางย่อย
         route_distances = []
         for r in routes:
             full_route = [nodes[0]] + r + [nodes[0]]
@@ -416,18 +459,14 @@ if st.session_state.get('show_results', False):
         total_fuel_cost = activity_data_A * fuel_price
         
         # ---------------------------------------------------------
-        # ⚠️ ระบบ Fleet Assignment ชั้นที่ 2 (Min-Max Greedy Balancing)
+        # ระบบ Fleet Assignment ชั้นที่ 2 (Min-Max Greedy Balancing)
         # ---------------------------------------------------------
-        # รวมข้อมูลแต่ละรอบเพื่อจัดลำดับ
         trip_data = [{"original_idx": i+1, "route": routes[i], "vol": route_vols[i], "dist": route_distances[i]} for i in range(len(routes))]
-        
-        # เรียงลำดับงานจากระยะทางมากไปน้อย
         trip_data.sort(key=lambda x: x['dist'], reverse=True)
         
         fleet_schedule = {f"🚛 รถขยะคันที่ {i+1}": [] for i in range(int(max_vehicles))}
         vehicle_workloads = {f"🚛 รถขยะคันที่ {i+1}": 0.0 for i in range(int(max_vehicles))}
         
-        # แจกงานให้รถคันที่มีระยะทางสะสมน้อยที่สุดเสมอ (Load Balancing)
         for t in trip_data:
             best_vehicle = min(vehicle_workloads, key=vehicle_workloads.get)
             t['trip_sequence'] = len(fleet_schedule[best_vehicle]) + 1
